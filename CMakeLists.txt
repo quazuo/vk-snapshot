@@ -61,7 +61,7 @@ add_library(imgui STATIC ${IMGUI_SRCS} ${IMGUI_IMPL_SRCS})
 
 target_link_libraries(imgui PUBLIC Vulkan::Vulkan)
 
-target_compile_options(imgui PRIVATE -w)
+target_compile_options(imgui PRIVATE -w -DIMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING)
 
 target_include_directories(imgui PUBLIC
         ${imgui_SOURCE_DIR}

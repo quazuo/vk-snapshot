@@ -39,7 +39,7 @@ void print_variadic(T&& arg, Ts&& ...args) {
     print_variadic(std::forward<Ts>(args)...);
 }
 
-// #define NDEBUG
+#define NDEBUG
 
 #ifndef NDEBUG
 #define PRINT_DEBUG_FN_ENTER(...) print_variadic("[VK_LAYER_Snapshot] ", __FUNCTION__, "(", __VA_ARGS__, ")\n");
@@ -119,6 +119,7 @@ struct LayerData {
     VkFence fence                          = VK_NULL_HANDLE;
 
     VkFormat swapchain_image_format;
+    VkExtent2D swapchain_extent;
     std::vector<VkImage> swapchain_images;
     std::vector<VkImageView> swapchain_image_views;
 };
@@ -147,9 +148,10 @@ public:
 
 LayerDataMap layer_data;
 
-bool is_creating_instance = false;
-bool is_creating_device   = false;
-bool is_rendering_window  = false;
+bool is_creating_instance   = false;
+bool is_creating_device     = false;
+bool is_rendering_window    = false;
+bool is_destroying_instance = false;
 
 static constexpr uint32_t WINDOW_WIDTH = 1200;
 static constexpr uint32_t WINDOW_HEIGHT = 900;
@@ -245,6 +247,7 @@ void init_imgui(LayerData& ld) {
         .PipelineInfoMain = {
             .MSAASamples = VK_SAMPLE_COUNT_1_BIT,
             .PipelineRenderingCreateInfo = VkPipelineRenderingCreateInfo {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR,
                 .colorAttachmentCount = 1u,
                 .pColorAttachmentFormats = &ld.swapchain_image_format,
             },
@@ -255,10 +258,14 @@ void init_imgui(LayerData& ld) {
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    // io.DisplaySize = ImVec2(WINDOW_WIDTH, WINDOW_HEIGHT);
     ImGui::StyleColorsDark();
     ImGui_ImplVulkan_Init(&imgui_init_info);
     ImGui_ImplWin32_Init(ld.hwnd);
+
+    // todo - might need to do this
+    // ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3, [](const char* fn_name, void* user_data = nullptr) {
+    //
+    // });
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -347,7 +354,8 @@ SnapshotLayer_CreateInstance(
     if (!is_creating_instance) {
         temp_ld.hwnd = create_window();
 
-        const std::vector<const char*> extension_names { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
+        const std::array<const char*, 1> layers { "VK_LAYER_KHRONOS_validation" };
+        const std::array<const char*, 2> extension_names { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
 
         const VkApplicationInfo app_info {
             .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -357,6 +365,8 @@ SnapshotLayer_CreateInstance(
         const VkInstanceCreateInfo instance_create_info {
             .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
             .pApplicationInfo = &app_info,
+            .enabledLayerCount = static_cast<uint32_t>(layers.size()),
+            .ppEnabledLayerNames = layers.data(),
             .enabledExtensionCount = static_cast<uint32_t>(extension_names.size()),
             .ppEnabledExtensionNames = extension_names.data(),
         };
@@ -399,11 +409,31 @@ SnapshotLayer_CreateInstance(
 VK_LAYER_EXPORT void VKAPI_CALL
 SnapshotLayer_DestroyInstance(VkInstance instance, const VkAllocationCallbacks* p_allocator) {
     PRINT_DEBUG_FN_ENTER(instance);
+
+    if (is_destroying_instance) {
+        layer_data.at(get_key(instance)).instance_dispatch->DestroyInstance(instance, p_allocator);
+        return;
+    }
+
     std::lock_guard l(global_lock);
     const LayerData& ld = layer_data.at(get_key(instance));
 
-    vkDestroySurfaceKHR(instance, ld.surface, nullptr);
+    vkDeviceWaitIdle(ld.device);
+
+    vkDestroyFence(ld.device, ld.fence, nullptr);
+    vkDestroySemaphore(ld.device, ld.render_finished_semaphore, nullptr);
+    vkDestroySemaphore(ld.device, ld.image_available_semaphore, nullptr);
+    vkDestroyDescriptorPool(ld.device, ld.imgui_descriptor_pool, nullptr);
+    vkDestroyCommandPool(ld.device, ld.cmd_pool, nullptr);
+    vkDestroySwapchainKHR(ld.device, ld.swapchain, nullptr);
+    vkDestroyDevice(ld.device, nullptr);
+    vkDestroySurfaceKHR(ld.instance, ld.surface, nullptr);
+    is_destroying_instance = true;
+    vkDestroyInstance(ld.instance, nullptr);
+    is_destroying_instance = false;
     DestroyWindow(ld.hwnd);
+
+    ld.instance_dispatch->DestroyInstance(instance, p_allocator);
 
     // layer_data.erase(get_key(instance));
 }
@@ -463,16 +493,12 @@ SnapshotLayer_CreateDevice(
 #define GET_DEVICE temp_ld.device
 
     if (!is_creating_device && temp_ld.device == VK_NULL_HANDLE) {
-        std::cout << "\thello 1\n";
-
         // device and queues
 
         uint32_t queue_family_count;
         INST_PROC_ADDR(vkGetPhysicalDeviceQueueFamilyProperties)(temp_ld.physical_device, &queue_family_count, nullptr);
         std::vector<VkQueueFamilyProperties> queue_family_properties(queue_family_count);
         INST_PROC_ADDR(vkGetPhysicalDeviceQueueFamilyProperties)(temp_ld.physical_device, &queue_family_count, queue_family_properties.data());
-
-        std::cout << "\thello 2\n";
 
         uint32_t graphics_queue_family_idx;
         {
@@ -486,8 +512,6 @@ SnapshotLayer_CreateDevice(
                 return VK_ERROR_INITIALIZATION_FAILED;
             }
         }
-
-        std::cout << "\thello 3\n";
 
         uint32_t present_queue_family_idx;
         {
@@ -505,39 +529,49 @@ SnapshotLayer_CreateDevice(
             }
         }
 
-        std::cout << "\thello 4\n";
-
         constexpr float queue_priority = 1.0f;
 
-        const std::array queue_create_infos {
+        std::vector queue_create_infos {
             VkDeviceQueueCreateInfo {
                 .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                 .queueFamilyIndex = present_queue_family_idx,
                 .queueCount = 1u,
                 .pQueuePriorities = &queue_priority,
             },
-            VkDeviceQueueCreateInfo {
+        };
+        if (present_queue_family_idx != graphics_queue_family_idx) {
+            queue_create_infos.emplace_back(VkDeviceQueueCreateInfo {
                 .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                 .queueFamilyIndex = graphics_queue_family_idx,
                 .queueCount = 1u,
                 .pQueuePriorities = &queue_priority,
-            },
-        };
+            });
+        }
 
         const std::array device_extensions {
             VK_KHR_SWAPCHAIN_EXTENSION_NAME,
             VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
         };
 
+        VkPhysicalDeviceSynchronization2Features sync2_feature {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
+            .synchronization2 = VK_TRUE,
+        };
+
+        const VkPhysicalDeviceDynamicRenderingFeatures dynamic_rendering_feature {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+            .pNext = &sync2_feature,
+            .dynamicRendering = VK_TRUE,
+        };
+
         const VkDeviceCreateInfo device_create_info {
             .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+            .pNext = &dynamic_rendering_feature,
             .queueCreateInfoCount = static_cast<uint32_t>(queue_create_infos.size()),
             .pQueueCreateInfos = queue_create_infos.data(),
             .enabledExtensionCount = static_cast<uint32_t>(device_extensions.size()),
             .ppEnabledExtensionNames = device_extensions.data(),
         };
-
-        std::cout << "\thello 5\n";
 
         is_creating_device = true;
         CHECK_RESULT(
@@ -546,12 +580,8 @@ SnapshotLayer_CreateDevice(
         )
         is_creating_device = false;
 
-        std::cout << "\thello 6\n";
-
         DEVICE_PROC_ADDR(vkGetDeviceQueue)(temp_ld.device, present_queue_family_idx, 0, &temp_ld.present_queue);
         DEVICE_PROC_ADDR(vkGetDeviceQueue)(temp_ld.device, graphics_queue_family_idx, 0, &temp_ld.gfx_queue);
-
-        std::cout << "\thello 7\n";
 
         // swapchain
 
@@ -560,8 +590,7 @@ SnapshotLayer_CreateDevice(
 
         VkSurfaceCapabilitiesKHR surface_capabilities;
         INST_PROC_ADDR(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)(temp_ld.physical_device, temp_ld.surface, &surface_capabilities);
-
-        std::cout << "\thello 8\n";
+        temp_ld.swapchain_extent = surface_capabilities.currentExtent;
 
         uint32_t format_count;
         INST_PROC_ADDR(vkGetPhysicalDeviceSurfaceFormatsKHR)(temp_ld.physical_device, temp_ld.surface, &format_count, nullptr);
@@ -569,15 +598,13 @@ SnapshotLayer_CreateDevice(
         INST_PROC_ADDR(vkGetPhysicalDeviceSurfaceFormatsKHR)(temp_ld.physical_device, temp_ld.surface, &format_count, formats.data());
         temp_ld.swapchain_image_format = formats[0].format;
 
-        std::cout << "\thello 8.1\n";
-
         const VkSwapchainCreateInfoKHR swapchain_create_info {
             .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
             .surface = temp_ld.surface,
             .minImageCount = 2u,
             .imageFormat = temp_ld.swapchain_image_format,
             .imageColorSpace = formats[0].colorSpace,
-            .imageExtent = VkExtent2D { WINDOW_WIDTH, WINDOW_HEIGHT },
+            .imageExtent = surface_capabilities.currentExtent,
             .imageArrayLayers = 1u,
             .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
             .imageSharingMode = are_queues_uniform ? VK_SHARING_MODE_EXCLUSIVE : VK_SHARING_MODE_CONCURRENT,
@@ -595,16 +622,12 @@ SnapshotLayer_CreateDevice(
             "Failed to create swapchain"
         );
 
-        std::cout << "\thello 8.2\n";
-
         // swapchain images
 
         uint32_t image_count;
         DEVICE_PROC_ADDR(vkGetSwapchainImagesKHR)(temp_ld.device, temp_ld.swapchain, &image_count, nullptr);
         temp_ld.swapchain_images.resize(image_count);
         DEVICE_PROC_ADDR(vkGetSwapchainImagesKHR)(temp_ld.device, temp_ld.swapchain, &image_count, temp_ld.swapchain_images.data());
-
-        std::cout << "\thello 9\n";
 
         // swapchain image views
 
@@ -630,8 +653,6 @@ SnapshotLayer_CreateDevice(
             );
         }
 
-        std::cout << "\thello 10\n";
-
         // command pool
 
         const VkCommandPoolCreateInfo pool_create_info {
@@ -644,8 +665,6 @@ SnapshotLayer_CreateDevice(
             DEVICE_PROC_ADDR(vkCreateCommandPool)(temp_ld.device, &pool_create_info, nullptr, &temp_ld.cmd_pool),
             "Failed to create command pool"
         );
-
-        std::cout << "\thello 11\n";
 
         // command buffer
 
@@ -660,8 +679,6 @@ SnapshotLayer_CreateDevice(
             DEVICE_PROC_ADDR(vkAllocateCommandBuffers)(temp_ld.device, &cmd_buf_alloc_info, &temp_ld.cmd_buffer),
             "Failed to allocate command buffer"
         );
-
-        std::cout << "\thello 12\n";
 
         // semaphores and fences
 
@@ -684,8 +701,6 @@ SnapshotLayer_CreateDevice(
             DEVICE_PROC_ADDR(vkCreateFence)(temp_ld.device, &fence_create_info, nullptr, &temp_ld.fence),
             "Failed to create fence"
         );
-
-        std::cout << "\thello 13\n";
 
         // imgui
 
@@ -710,6 +725,7 @@ SnapshotLayer_CreateDevice(
         ld.fence                        = temp_ld.fence;
 
         ld.swapchain_image_format       = temp_ld.swapchain_image_format;
+        ld.swapchain_extent             = temp_ld.swapchain_extent;
         ld.swapchain_images             = temp_ld.swapchain_images;
         ld.swapchain_image_views        = temp_ld.swapchain_image_views;
     }
@@ -720,8 +736,14 @@ SnapshotLayer_CreateDevice(
 VK_LAYER_EXPORT void VKAPI_CALL
 SnapshotLayer_DestroyDevice(VkDevice device, const VkAllocationCallbacks* p_allocator) {
     PRINT_DEBUG_FN_ENTER();
+
+    if (is_destroying_instance) {
+        layer_data.at(get_key(device)).device_dispatch->DestroyDevice(device, p_allocator);
+        return;
+    }
+
     std::lock_guard l(global_lock);
-    const LayerData& ld = layer_data.at(get_key(device));
+    layer_data.at(get_key(device)).device_dispatch->DestroyDevice(device, p_allocator);
 
     // layer_data.erase(get_key(device));
 }
@@ -746,7 +768,6 @@ SnapshotLayer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* p_present_i
 
     // record command buffer for our auxiliary window
     if (!is_rendering_window) {
-        std::cout << "\tRENDERING IMGUI FOR WINDOW!\n";
         is_rendering_window = true;
 
         vkWaitForFences(ld.device, 1, &ld.fence, VK_TRUE, UINT64_MAX);
@@ -757,8 +778,6 @@ SnapshotLayer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* p_present_i
 
         vkResetCommandBuffer(ld.cmd_buffer, 0);
 
-        std::cout << "\theyy 1\n";
-
         const VkCommandBufferBeginInfo begin_info {
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
         };
@@ -767,7 +786,35 @@ SnapshotLayer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* p_present_i
             throw std::runtime_error("failed to begin recording command buffer!");
         }
 
-        std::cout << "\theyy 2\n";
+        // transition swapchain image to color attachment layout
+        {
+            const VkImageMemoryBarrier2 image_memory_barrier {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = ld.swapchain_images[image_index],
+                .subresourceRange = {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                }
+            };
+
+            const VkDependencyInfo dependency_info {
+                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                .imageMemoryBarrierCount = 1u,
+                .pImageMemoryBarriers = &image_memory_barrier,
+            };
+
+            vkCmdPipelineBarrier2(ld.cmd_buffer, &dependency_info);
+        }
 
         std::vector<VkRenderingAttachmentInfo> attachment_infos;
         attachment_infos.emplace_back(VkRenderingAttachmentInfo {
@@ -785,7 +832,7 @@ SnapshotLayer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* p_present_i
             .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
             .renderArea = VkRect2D {
                 .offset = VkOffset2D { 0, 0 },
-                .extent = VkExtent2D { WINDOW_WIDTH, WINDOW_HEIGHT }
+                .extent = ld.swapchain_extent
             },
             .layerCount = 1u,
             .colorAttachmentCount = static_cast<uint32_t>(attachment_infos.size()),
@@ -794,13 +841,9 @@ SnapshotLayer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* p_present_i
 
         INST_PROC_ADDR(vkCmdBeginRendering)(ld.cmd_buffer, &rendering_info);
 
-        std::cout << "\theyy 3\n";
-
         ImGui_ImplVulkan_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
-
-        std::cout << "\theyy 4\n";
 
         constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar
                                            | ImGuiWindowFlags_NoCollapse
@@ -813,22 +856,44 @@ SnapshotLayer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* p_present_i
 
         if (ImGui::Begin("main window", nullptr, flags)) {
             ImGui::Text("This is some useful text.");
-            std::cout << "\theyy 5\n";
-            ImGui::End(); std::cout << "\theyy 5.1\n";
+            ImGui::End();
         }
 
-        ImGui::Render(); std::cout << "\theyy 5.2\n";
+        ImGui::Render();
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), ld.cmd_buffer);
-
-        std::cout << "\theyy 6\n";
 
         vkCmdEndRendering(ld.cmd_buffer);
 
-        std::cout << "\theyy 7\n";
+        {
+            const VkImageMemoryBarrier2 image_memory_barrier {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = ld.swapchain_images[image_index],
+                .subresourceRange = {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+            };
+
+            const VkDependencyInfo dependency_info {
+                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                .imageMemoryBarrierCount = 1u,
+                .pImageMemoryBarriers = &image_memory_barrier,
+            };
+
+            vkCmdPipelineBarrier2(ld.cmd_buffer, &dependency_info);
+        }
 
         vkEndCommandBuffer(ld.cmd_buffer);
-
-        std::cout << "\theyy 8\n";
 
         const VkPipelineStageFlags wait_stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         const VkSubmitInfo submit_info {
@@ -838,6 +903,7 @@ SnapshotLayer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* p_present_i
             .pWaitDstStageMask = &wait_stages,
             .commandBufferCount = 1u,
             .pCommandBuffers = &ld.cmd_buffer,
+            .signalSemaphoreCount = 1u,
             .pSignalSemaphores = &ld.render_finished_semaphore,
         };
 
