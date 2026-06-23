@@ -51,15 +51,15 @@ file(GLOB IMGUI_SRCS
 )
 
 set(IMGUI_IMPL_SRCS
-        ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.h
-        ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.h
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
         ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.h
         ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
 add_library(imgui STATIC ${IMGUI_SRCS} ${IMGUI_IMPL_SRCS})
 
-target_link_libraries(imgui PUBLIC Vulkan::Vulkan glfw)
+target_link_libraries(imgui PUBLIC Vulkan::Vulkan)
 
 target_compile_options(imgui PRIVATE -w)
 
