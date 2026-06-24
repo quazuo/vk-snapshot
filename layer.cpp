@@ -23,6 +23,7 @@
 #include <ranges>
 #include <sstream>
 #include <stacktrace>
+#include <variant>
 
 #undef VK_LAYER_EXPORT
 #ifdef _WIN32
@@ -84,6 +85,7 @@ if (const VkResult r = (result); r != VK_SUCCESS) { \
     ADD_HOOK(CmdDrawIndexed)                        \
     ADD_HOOK(BeginCommandBuffer)                    \
     ADD_HOOK(EndCommandBuffer)                      \
+    ADD_HOOK(QueueSubmit)                           \
     ADD_HOOK(QueuePresentKHR)
 
 template<typename DispatchableType>
@@ -94,6 +96,45 @@ void *get_key(DispatchableType inst) {
 std::mutex global_lock;
 
 std::map<VkPhysicalDevice, VkInstance> phys_device_to_instance_map;
+
+struct EventParams_Draw {
+    uint32_t vertex_count;
+    uint32_t instance_count;
+    uint32_t first_vertex;
+    uint32_t first_instance;
+
+    std::string to_string() const {
+        return std::format("Draw({}, {}, {}, {})", vertex_count, instance_count, first_vertex, first_instance);
+    }
+};
+
+struct EventParams_DrawIndexed {
+    uint32_t index_count;
+    uint32_t instance_count;
+    uint32_t first_index;
+    int32_t  vertex_offset;
+    uint32_t first_instance;
+
+    std::string to_string() const {
+        return std::format("DrawIndexed({}, {}, {}, {}, {})", index_count, instance_count, first_index, vertex_offset, first_instance);
+    }
+};
+
+struct EventParams_Dispatch {
+    uint32_t group_count_x;
+    uint32_t group_count_y;
+    uint32_t group_count_z;
+
+    std::string to_string() const {
+        return std::format("Dispatch({}, {}, {})", group_count_x, group_count_y, group_count_z);
+    }
+};
+
+using EventParams = std::variant<
+    EventParams_Draw,
+    EventParams_DrawIndexed,
+    EventParams_Dispatch
+>;
 
 struct LayerData {
     std::unique_ptr<VkuInstanceDispatchTable> instance_dispatch;
@@ -122,6 +163,9 @@ struct LayerData {
     VkExtent2D swapchain_extent;
     std::vector<VkImage> swapchain_images;
     std::vector<VkImageView> swapchain_image_views;
+
+    std::map<VkCommandBuffer, std::vector<EventParams>> curr_frame_event_params;
+    std::vector<VkCommandBuffer> curr_frame_submitted_cmd_buffers;
 };
 
 class LayerDataMap {
@@ -184,7 +228,7 @@ HWND create_window() {
         0,
         wc.lpszClassName,
         TEXT("Snapshot Layer"),
-        WS_OVERLAPPEDWINDOW,
+        WS_OVERLAPPEDWINDOW ^ WS_THICKFRAME,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         WINDOW_WIDTH,
@@ -262,6 +306,47 @@ void init_imgui(LayerData& ld) {
     // ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3, [](const char* fn_name, void* user_data = nullptr) {
     //
     // });
+}
+
+void render_imgui(const LayerData& ld) {
+    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar
+                                       | ImGuiWindowFlags_NoCollapse
+                                       | ImGuiWindowFlags_NoSavedSettings
+                                       | ImGuiWindowFlags_NoResize
+                                       | ImGuiWindowFlags_NoMove;
+
+    const auto& io = ImGui::GetIO();
+    const ImVec2 window_size = ImVec2(io.DisplaySize.x, io.DisplaySize.y);
+
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(window_size);
+
+    if (ImGui::Begin("main window", nullptr, flags)) {
+        if (ImGui::BeginListBox("event list", window_size)) {
+            uint32_t event_counter = 1;
+
+            for (const auto& cmd_buf : ld.curr_frame_submitted_cmd_buffers) {
+                if (!ld.curr_frame_event_params.contains(cmd_buf)) continue;
+
+                for (const auto& event : ld.curr_frame_event_params.at(cmd_buf)) {
+                    const std::string item_text = std::format(
+                        "[{}]\t {}",
+                        event_counter,
+                        std::visit([](const auto& event) { return event.to_string(); }, event)
+                    );
+                    if (ImGui::Selectable(item_text.c_str())) {
+                        std::cout << "[clicked]: " << item_text << std::endl;
+                    }
+
+                    event_counter++;
+                }
+            }
+
+            ImGui::EndListBox();
+        }
+
+        ImGui::End();
+    }
 }
 
 void render_layer_window(const LayerData& ld) {
@@ -343,19 +428,7 @@ void render_layer_window(const LayerData& ld) {
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar
-                                       | ImGuiWindowFlags_NoCollapse
-                                       | ImGuiWindowFlags_NoSavedSettings
-                                       | ImGuiWindowFlags_NoResize
-                                       | ImGuiWindowFlags_NoMove;
-
-    ImGui::SetNextWindowPos(ImVec2(0, 0));
-    ImGui::SetNextWindowSize(ImVec2(WINDOW_WIDTH, WINDOW_HEIGHT));
-
-    if (ImGui::Begin("main window", nullptr, flags)) {
-        ImGui::Text("This is some useful text.");
-        ImGui::End();
-    }
+    render_imgui(ld);
 
     ImGui::Render();
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), ld.cmd_buffer);
@@ -551,10 +624,10 @@ SnapshotLayer_CreateInstance(
         LayerData& ld = layer_data.at(get_key(*p_instance));
         ld.instance_dispatch = std::make_unique<VkuInstanceDispatchTable>(std::move(dispatch_table));
         ld.sub_instance_gipa = gipa;
-        ld.hwnd = temp_ld.hwnd;
-        ld.app_instance = *p_instance;
-        ld.instance = temp_ld.instance;
-        ld.surface = temp_ld.surface;
+        ld.hwnd              = temp_ld.hwnd;
+        ld.app_instance      = *p_instance;
+        ld.instance          = temp_ld.instance;
+        ld.surface           = temp_ld.surface;
     }
 
     return VK_SUCCESS;
@@ -907,6 +980,31 @@ SnapshotLayer_DestroyDevice(VkDevice device, const VkAllocationCallbacks* p_allo
 ///////////////////////////////////////////////////////////////////////////////
 
 VK_LAYER_EXPORT VkResult VKAPI_CALL
+SnapshotLayer_QueueSubmit(
+    VkQueue                 queue,
+    uint32_t                submit_count,
+    const VkSubmitInfo *    p_submits,
+    VkFence                 fence
+) {
+    PRINT_DEBUG_FN_ENTER();
+
+    if (is_rendering_window) {
+        return layer_data.at(get_key(queue)).device_dispatch->QueueSubmit(queue, submit_count, p_submits, fence);
+    }
+
+    std::lock_guard l(global_lock);
+    LayerData& ld = layer_data.at(get_key(queue));
+
+    for (uint32_t i = 0; i < submit_count; i++) {
+        for (uint32_t j = 0; j < p_submits[i].commandBufferCount; j++) {
+            ld.curr_frame_submitted_cmd_buffers.emplace_back(p_submits[i].pCommandBuffers[j]);
+        }
+    }
+
+    return ld.device_dispatch->QueueSubmit(queue, submit_count, p_submits, fence);
+}
+
+VK_LAYER_EXPORT VkResult VKAPI_CALL
 SnapshotLayer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* p_present_info) {
     PRINT_DEBUG_FN_ENTER();
 
@@ -915,13 +1013,16 @@ SnapshotLayer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* p_present_i
     }
 
     std::lock_guard l(global_lock);
-    const LayerData& ld = layer_data.at(get_key(queue));
+    LayerData& ld = layer_data.at(get_key(queue));
 
     is_rendering_window = true;
     render_layer_window(ld);
     is_rendering_window = false;
 
-    return layer_data.at(get_key(queue)).device_dispatch->QueuePresentKHR(queue, p_present_info);
+    ld.curr_frame_submitted_cmd_buffers.clear();
+    ld.curr_frame_event_params.clear();
+
+    return ld.device_dispatch->QueuePresentKHR(queue, p_present_info);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -968,8 +1069,14 @@ SnapshotLayer_CmdDraw(
     }
 
     std::lock_guard l(global_lock);
-    return layer_data.at(get_key(command_buffer)).device_dispatch->
-        CmdDraw(command_buffer, vertex_count, instance_count, first_vertex, first_instance);
+    LayerData& ld = layer_data.at(get_key(command_buffer));
+
+    if (!ld.curr_frame_event_params.contains(command_buffer)) {
+        ld.curr_frame_event_params.emplace(command_buffer, std::vector<EventParams> {});
+    }
+    ld.curr_frame_event_params.at(command_buffer).emplace_back(EventParams_Draw { vertex_count, instance_count, first_vertex, first_instance });
+
+    return ld.device_dispatch->CmdDraw(command_buffer, vertex_count, instance_count, first_vertex, first_instance);
 }
 
 VK_LAYER_EXPORT void VKAPI_CALL 
@@ -989,8 +1096,34 @@ SnapshotLayer_CmdDrawIndexed(
     }
 
     std::lock_guard l(global_lock);
-    return layer_data.at(get_key(command_buffer)).device_dispatch->
-        CmdDrawIndexed(command_buffer, index_count, instance_count, first_index, vertex_offset, first_instance);
+    LayerData& ld = layer_data.at(get_key(command_buffer));
+
+    if (!ld.curr_frame_event_params.contains(command_buffer)) {
+        ld.curr_frame_event_params.emplace(command_buffer, std::vector<EventParams> {});
+    }
+    ld.curr_frame_event_params.at(command_buffer).emplace_back(EventParams_DrawIndexed {
+        index_count, instance_count, first_index, vertex_offset, first_instance });
+
+    return ld.device_dispatch->CmdDrawIndexed(command_buffer, index_count, instance_count, first_index, vertex_offset, first_instance);
+}
+
+VK_LAYER_EXPORT void VKAPI_CALL
+SnapshotLayer_CmdDispatch(
+    VkCommandBuffer     command_buffer,
+    uint32_t            group_count_x,
+    uint32_t            group_count_y,
+    uint32_t            group_count_z
+) {
+    PRINT_DEBUG_FN_ENTER();
+    std::lock_guard l(global_lock);
+    LayerData& ld = layer_data.at(get_key(command_buffer));
+
+    if (!ld.curr_frame_event_params.contains(command_buffer)) {
+        ld.curr_frame_event_params.emplace(command_buffer, std::vector<EventParams> {});
+    }
+    ld.curr_frame_event_params.at(command_buffer).emplace_back(EventParams_Dispatch { group_count_x, group_count_y, group_count_z });
+
+    return ld.device_dispatch->CmdDispatch(command_buffer, group_count_x, group_count_y, group_count_z);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -998,8 +1131,7 @@ SnapshotLayer_CmdDrawIndexed(
 ///////////////////////////////////////////////////////////////////////////////
 
 VK_LAYER_EXPORT VkResult VKAPI_CALL 
-SnapshotLayer_EnumerateInstanceLayerProperties(uint32_t *p_property_count, VkLayerProperties *p_properties)
-{
+SnapshotLayer_EnumerateInstanceLayerProperties(uint32_t *p_property_count, VkLayerProperties *p_properties) {
     PRINT_DEBUG_FN_ENTER();
     if (p_property_count) *p_property_count = 1;
 
@@ -1055,7 +1187,8 @@ SnapshotLayer_EnumerateDeviceExtensionProperties(
         }
 
         std::lock_guard l(global_lock);
-        return layer_data.at_pd(physical_device).instance_dispatch->EnumerateDeviceExtensionProperties(physical_device, p_layer_name, p_property_count, p_properties);
+        return layer_data.at_pd(physical_device).instance_dispatch
+            ->EnumerateDeviceExtensionProperties(physical_device, p_layer_name, p_property_count, p_properties);
     }
 
     if (p_property_count) {
