@@ -917,12 +917,9 @@ SnapshotLayer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* p_present_i
     std::lock_guard l(global_lock);
     const LayerData& ld = layer_data.at(get_key(queue));
 
-    // record command buffer for our auxiliary window
-    if (!is_rendering_window) {
-        is_rendering_window = true;
-        render_layer_window(ld);
-        is_rendering_window = false;
-    }
+    is_rendering_window = true;
+    render_layer_window(ld);
+    is_rendering_window = false;
 
     return layer_data.at(get_key(queue)).device_dispatch->QueuePresentKHR(queue, p_present_info);
 }
