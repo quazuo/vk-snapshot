@@ -157,7 +157,7 @@ static constexpr uint32_t WINDOW_WIDTH = 1200;
 static constexpr uint32_t WINDOW_HEIGHT = 900;
 
 ///////////////////////////////////////////////////////////////////////////////
-// Window
+// Window & ImGui
 ///////////////////////////////////////////////////////////////////////////////
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -205,10 +205,6 @@ HWND create_window() {
 
     return hwnd;
 }
-
-///////////////////////////////////////////////////////////////////////////////
-// ImGui
-///////////////////////////////////////////////////////////////////////////////
 
 void init_imgui(LayerData& ld) {
     const std::vector<VkDescriptorPoolSize> pool_sizes {
@@ -266,6 +262,164 @@ void init_imgui(LayerData& ld) {
     // ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3, [](const char* fn_name, void* user_data = nullptr) {
     //
     // });
+}
+
+void render_layer_window(const LayerData& ld) {
+#define GET_INSTANCE ld.instance
+#define GET_DEVICE ld.device
+
+    vkWaitForFences(ld.device, 1, &ld.fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(ld.device, 1, &ld.fence);
+
+    uint32_t image_index;
+    vkAcquireNextImageKHR(ld.device, ld.swapchain, UINT64_MAX, ld.image_available_semaphore, VK_NULL_HANDLE, &image_index);
+
+    vkResetCommandBuffer(ld.cmd_buffer, 0);
+
+    const VkCommandBufferBeginInfo begin_info {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+    };
+
+    if (vkBeginCommandBuffer(ld.cmd_buffer, &begin_info) != VK_SUCCESS) {
+        throw std::runtime_error("failed to begin recording command buffer!");
+    }
+
+    // transition swapchain image to color attachment layout
+    {
+        const VkImageMemoryBarrier2 image_memory_barrier {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = ld.swapchain_images[image_index],
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            }
+        };
+
+        const VkDependencyInfo dependency_info {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .imageMemoryBarrierCount = 1u,
+            .pImageMemoryBarriers = &image_memory_barrier,
+        };
+
+        vkCmdPipelineBarrier2(ld.cmd_buffer, &dependency_info);
+    }
+
+    std::vector<VkRenderingAttachmentInfo> attachment_infos;
+    attachment_infos.emplace_back(VkRenderingAttachmentInfo {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = ld.swapchain_image_views[image_index],
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .clearValue = VkClearValue {
+            .color = VkClearColorValue { 0.5f, 0.5f, 0.5f, 1.0f }
+        }
+    });
+
+    const VkRenderingInfo rendering_info {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = VkRect2D {
+            .offset = VkOffset2D { 0, 0 },
+            .extent = ld.swapchain_extent
+        },
+        .layerCount = 1u,
+        .colorAttachmentCount = static_cast<uint32_t>(attachment_infos.size()),
+        .pColorAttachments = attachment_infos.data(),
+    };
+
+    INST_PROC_ADDR(vkCmdBeginRendering)(ld.cmd_buffer, &rendering_info);
+
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+
+    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar
+                                       | ImGuiWindowFlags_NoCollapse
+                                       | ImGuiWindowFlags_NoSavedSettings
+                                       | ImGuiWindowFlags_NoResize
+                                       | ImGuiWindowFlags_NoMove;
+
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(ImVec2(WINDOW_WIDTH, WINDOW_HEIGHT));
+
+    if (ImGui::Begin("main window", nullptr, flags)) {
+        ImGui::Text("This is some useful text.");
+        ImGui::End();
+    }
+
+    ImGui::Render();
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), ld.cmd_buffer);
+
+    vkCmdEndRendering(ld.cmd_buffer);
+
+    {
+        const VkImageMemoryBarrier2 image_memory_barrier {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = ld.swapchain_images[image_index],
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        };
+
+        const VkDependencyInfo dependency_info {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .imageMemoryBarrierCount = 1u,
+            .pImageMemoryBarriers = &image_memory_barrier,
+        };
+
+        vkCmdPipelineBarrier2(ld.cmd_buffer, &dependency_info);
+    }
+
+    vkEndCommandBuffer(ld.cmd_buffer);
+
+    const VkPipelineStageFlags wait_stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    const VkSubmitInfo submit_info {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .waitSemaphoreCount = 1u,
+        .pWaitSemaphores = &ld.image_available_semaphore,
+        .pWaitDstStageMask = &wait_stages,
+        .commandBufferCount = 1u,
+        .pCommandBuffers = &ld.cmd_buffer,
+        .signalSemaphoreCount = 1u,
+        .pSignalSemaphores = &ld.render_finished_semaphore,
+    };
+
+    vkQueueSubmit(ld.gfx_queue, 1u, &submit_info, ld.fence);
+
+    const VkPresentInfoKHR present_info {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1u,
+        .pWaitSemaphores = &ld.render_finished_semaphore,
+        .swapchainCount = 1u,
+        .pSwapchains = &ld.swapchain,
+        .pImageIndices = &image_index,
+    };
+
+    vkQueuePresentKHR(ld.present_queue, &present_info);
+
+#undef GET_INSTANCE
+#undef GET_DEVICE
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -763,168 +917,12 @@ SnapshotLayer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* p_present_i
     std::lock_guard l(global_lock);
     const LayerData& ld = layer_data.at(get_key(queue));
 
-#define GET_INSTANCE ld.instance
-#define GET_DEVICE ld.device
-
     // record command buffer for our auxiliary window
     if (!is_rendering_window) {
         is_rendering_window = true;
-
-        vkWaitForFences(ld.device, 1, &ld.fence, VK_TRUE, UINT64_MAX);
-        vkResetFences(ld.device, 1, &ld.fence);
-
-        uint32_t image_index;
-        vkAcquireNextImageKHR(ld.device, ld.swapchain, UINT64_MAX, ld.image_available_semaphore, VK_NULL_HANDLE, &image_index);
-
-        vkResetCommandBuffer(ld.cmd_buffer, 0);
-
-        const VkCommandBufferBeginInfo begin_info {
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
-        };
-
-        if (vkBeginCommandBuffer(ld.cmd_buffer, &begin_info) != VK_SUCCESS) {
-            throw std::runtime_error("failed to begin recording command buffer!");
-        }
-
-        // transition swapchain image to color attachment layout
-        {
-            const VkImageMemoryBarrier2 image_memory_barrier {
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-                .srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = ld.swapchain_images[image_index],
-                .subresourceRange = {
-                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .baseMipLevel = 0,
-                    .levelCount = 1,
-                    .baseArrayLayer = 0,
-                    .layerCount = 1,
-                }
-            };
-
-            const VkDependencyInfo dependency_info {
-                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                .imageMemoryBarrierCount = 1u,
-                .pImageMemoryBarriers = &image_memory_barrier,
-            };
-
-            vkCmdPipelineBarrier2(ld.cmd_buffer, &dependency_info);
-        }
-
-        std::vector<VkRenderingAttachmentInfo> attachment_infos;
-        attachment_infos.emplace_back(VkRenderingAttachmentInfo {
-            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView = ld.swapchain_image_views[image_index],
-            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-            .clearValue = VkClearValue {
-                .color = VkClearColorValue { 0.5f, 0.5f, 0.5f, 1.0f }
-            }
-        });
-
-        const VkRenderingInfo rendering_info {
-            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .renderArea = VkRect2D {
-                .offset = VkOffset2D { 0, 0 },
-                .extent = ld.swapchain_extent
-            },
-            .layerCount = 1u,
-            .colorAttachmentCount = static_cast<uint32_t>(attachment_infos.size()),
-            .pColorAttachments = attachment_infos.data(),
-        };
-
-        INST_PROC_ADDR(vkCmdBeginRendering)(ld.cmd_buffer, &rendering_info);
-
-        ImGui_ImplVulkan_NewFrame();
-        ImGui_ImplWin32_NewFrame();
-        ImGui::NewFrame();
-
-        constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar
-                                           | ImGuiWindowFlags_NoCollapse
-                                           | ImGuiWindowFlags_NoSavedSettings
-                                           | ImGuiWindowFlags_NoResize
-                                           | ImGuiWindowFlags_NoMove;
-
-        ImGui::SetNextWindowPos(ImVec2(0, 0));
-        ImGui::SetNextWindowSize(ImVec2(WINDOW_WIDTH, WINDOW_HEIGHT));
-
-        if (ImGui::Begin("main window", nullptr, flags)) {
-            ImGui::Text("This is some useful text.");
-            ImGui::End();
-        }
-
-        ImGui::Render();
-        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), ld.cmd_buffer);
-
-        vkCmdEndRendering(ld.cmd_buffer);
-
-        {
-            const VkImageMemoryBarrier2 image_memory_barrier {
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-                .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                .dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = ld.swapchain_images[image_index],
-                .subresourceRange = {
-                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .baseMipLevel = 0,
-                    .levelCount = 1,
-                    .baseArrayLayer = 0,
-                    .layerCount = 1,
-                },
-            };
-
-            const VkDependencyInfo dependency_info {
-                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                .imageMemoryBarrierCount = 1u,
-                .pImageMemoryBarriers = &image_memory_barrier,
-            };
-
-            vkCmdPipelineBarrier2(ld.cmd_buffer, &dependency_info);
-        }
-
-        vkEndCommandBuffer(ld.cmd_buffer);
-
-        const VkPipelineStageFlags wait_stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        const VkSubmitInfo submit_info {
-            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .waitSemaphoreCount = 1u,
-            .pWaitSemaphores = &ld.image_available_semaphore,
-            .pWaitDstStageMask = &wait_stages,
-            .commandBufferCount = 1u,
-            .pCommandBuffers = &ld.cmd_buffer,
-            .signalSemaphoreCount = 1u,
-            .pSignalSemaphores = &ld.render_finished_semaphore,
-        };
-
-        vkQueueSubmit(ld.gfx_queue, 1u, &submit_info, ld.fence);
-
-        const VkPresentInfoKHR present_info {
-            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-            .waitSemaphoreCount = 1u,
-            .pWaitSemaphores = &ld.render_finished_semaphore,
-            .swapchainCount = 1u,
-            .pSwapchains = &ld.swapchain,
-            .pImageIndices = &image_index,
-        };
-
-        vkQueuePresentKHR(ld.present_queue, &present_info);
-
+        render_layer_window(ld);
         is_rendering_window = false;
     }
-
-#undef GET_DEVICE
-#undef GET_INSTANCE
 
     return layer_data.at(get_key(queue)).device_dispatch->QueuePresentKHR(queue, p_present_info);
 }
