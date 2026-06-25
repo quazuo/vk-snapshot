@@ -25,6 +25,8 @@
 #include <stacktrace>
 #include <variant>
 
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
 #undef VK_LAYER_EXPORT
 #ifdef _WIN32
 #define VK_LAYER_EXPORT extern "C" __declspec(dllexport)
@@ -83,10 +85,14 @@ if (const VkResult r = (result); r != VK_SUCCESS) { \
     ADD_HOOK(DestroyDevice)                         \
     ADD_HOOK(CmdDraw)                               \
     ADD_HOOK(CmdDrawIndexed)                        \
+    ADD_HOOK(CmdDispatch)                           \
     ADD_HOOK(BeginCommandBuffer)                    \
     ADD_HOOK(EndCommandBuffer)                      \
     ADD_HOOK(QueueSubmit)                           \
-    ADD_HOOK(QueuePresentKHR)
+    ADD_HOOK(QueuePresentKHR)                       \
+    ADD_HOOK(CmdDebugMarkerBeginEXT)                \
+    ADD_HOOK(CmdDebugMarkerEndEXT)                  \
+    ADD_HOOK(CmdDebugMarkerInsertEXT)
 
 template<typename DispatchableType>
 void *get_key(DispatchableType inst) {
@@ -130,19 +136,38 @@ struct EventParams_Dispatch {
     }
 };
 
+struct EventParams_DebugMarkerBegin {
+    std::string name;
+
+    std::string to_string() const { return std::format("[MARKER BEGIN] {}", name); }
+};
+
+struct EventParams_DebugMarkerEnd {
+    std::string to_string() const { return "[MARKER END]"; }
+};
+
+struct EventParams_DebugMarkerInsert {
+    std::string name;
+
+    std::string to_string() const { return std::format("[MARKER] {}", name); }
+};
+
 using EventParams = std::variant<
     EventParams_Draw,
     EventParams_DrawIndexed,
-    EventParams_Dispatch
+    EventParams_Dispatch,
+    EventParams_DebugMarkerBegin,
+    EventParams_DebugMarkerEnd,
+    EventParams_DebugMarkerInsert
 >;
 
 struct LayerData {
     std::unique_ptr<VkuInstanceDispatchTable> instance_dispatch;
     std::unique_ptr<VkuDeviceDispatchTable> device_dispatch;
 
-    PFN_vkGetInstanceProcAddr sub_instance_gipa = nullptr;
-
     HWND hwnd = nullptr;
+
+    ImGuiContext* imgui_ctx = nullptr;
 
     VkInstance app_instance                = VK_NULL_HANDLE;
     VkInstance instance                    = VK_NULL_HANDLE;
@@ -159,8 +184,8 @@ struct LayerData {
     VkSemaphore render_finished_semaphore  = VK_NULL_HANDLE;
     VkFence fence                          = VK_NULL_HANDLE;
 
-    VkFormat swapchain_image_format;
-    VkExtent2D swapchain_extent;
+    VkFormat swapchain_image_format {};
+    VkExtent2D swapchain_extent {};
     std::vector<VkImage> swapchain_images;
     std::vector<VkImageView> swapchain_image_views;
 
@@ -176,7 +201,7 @@ public:
 
     void add_device_alias(void *inst_key, void *device_key) { layer_data.emplace(device_key, layer_data.at(inst_key)); }
 
-    LayerData& at(void *key) {
+    LayerData& at(void *key) const {
         if (!layer_data.contains(key)) {
             PRINT_ERROR("Tried to access layer data with an unknown key");
             std::cout << std::stacktrace::current() << "\n";
@@ -197,14 +222,17 @@ bool is_creating_device     = false;
 bool is_rendering_window    = false;
 bool is_destroying_instance = false;
 
-static constexpr uint32_t WINDOW_WIDTH = 1200;
-static constexpr uint32_t WINDOW_HEIGHT = 900;
+static constexpr uint32_t WINDOW_WIDTH = 800;
+static constexpr uint32_t WINDOW_HEIGHT = 1200;
 
 ///////////////////////////////////////////////////////////////////////////////
 // Window & ImGui
 ///////////////////////////////////////////////////////////////////////////////
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
+        return true;
+
     switch (msg) {
         case WM_CLOSE:
             DestroyWindow(hwnd);
@@ -295,7 +323,7 @@ void init_imgui(LayerData& ld) {
         .UseDynamicRendering = true,
     };
 
-    ImGui::CreateContext();
+    ld.imgui_ctx = ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::StyleColorsDark();
@@ -309,44 +337,61 @@ void init_imgui(LayerData& ld) {
 }
 
 void render_imgui(const LayerData& ld) {
-    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar
-                                       | ImGuiWindowFlags_NoCollapse
-                                       | ImGuiWindowFlags_NoSavedSettings
-                                       | ImGuiWindowFlags_NoResize
-                                       | ImGuiWindowFlags_NoMove;
+    constexpr ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoTitleBar
+                                            | ImGuiWindowFlags_NoCollapse
+                                            | ImGuiWindowFlags_NoSavedSettings
+                                            | ImGuiWindowFlags_NoResize
+                                            | ImGuiWindowFlags_NoMove;
+
+    constexpr ImGuiTableFlags table_flags = ImGuiTableFlags_RowBg
+                                          | ImGuiTableFlags_Borders
+                                          | ImGuiTableFlags_SizingFixedFit
+                                          | ImGuiTableFlags_NoSavedSettings;
+
+    ImGuiContext* old_imgui_ctx = ImGui::GetCurrentContext();
+    ImGui::SetCurrentContext(ld.imgui_ctx);
 
     const auto& io = ImGui::GetIO();
     const ImVec2 window_size = ImVec2(io.DisplaySize.x, io.DisplaySize.y);
+    const ImVec2 window_padding = ImGui::GetStyle().WindowPadding;
 
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(window_size);
 
-    if (ImGui::Begin("main window", nullptr, flags)) {
-        if (ImGui::BeginListBox("event list", window_size)) {
+    if (ImGui::Begin("main window", nullptr, window_flags)) {
+        if (ImGui::BeginTable("event list", 2, table_flags, ImVec2(window_size.x - 2 * window_padding.x, 0))) {
             uint32_t event_counter = 1;
+
+            ImGui::TableSetupColumn("Event ID");
+            ImGui::TableSetupColumn("Event name", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
 
             for (const auto& cmd_buf : ld.curr_frame_submitted_cmd_buffers) {
                 if (!ld.curr_frame_event_params.contains(cmd_buf)) continue;
 
                 for (const auto& event : ld.curr_frame_event_params.at(cmd_buf)) {
-                    const std::string item_text = std::format(
-                        "[{}]\t {}",
-                        event_counter,
-                        std::visit([](const auto& event) { return event.to_string(); }, event)
-                    );
-                    if (ImGui::Selectable(item_text.c_str())) {
-                        std::cout << "[clicked]: " << item_text << std::endl;
+                    const std::string item_text = std::visit([](const auto& e) { return e.to_string(); }, event);
+                                                  // + "##" + std::to_string(event_counter);
+
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    if (ImGui::Selectable(std::to_string(event_counter).c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+                        std::cout << "clicked " << event_counter << "\n";
                     }
+                    ImGui::TableNextColumn();
+                    ImGui::Text(item_text.c_str());
 
                     event_counter++;
                 }
             }
 
-            ImGui::EndListBox();
+            ImGui::EndTable();
         }
 
         ImGui::End();
     }
+
+    ImGui::SetCurrentContext(old_imgui_ctx);
 }
 
 void render_layer_window(const LayerData& ld) {
@@ -623,7 +668,6 @@ SnapshotLayer_CreateInstance(
         layer_data.emplace(get_key(*p_instance));
         LayerData& ld = layer_data.at(get_key(*p_instance));
         ld.instance_dispatch = std::make_unique<VkuInstanceDispatchTable>(std::move(dispatch_table));
-        ld.sub_instance_gipa = gipa;
         ld.hwnd              = temp_ld.hwnd;
         ld.app_instance      = *p_instance;
         ld.instance          = temp_ld.instance;
@@ -940,6 +984,8 @@ SnapshotLayer_CreateDevice(
     if (!is_creating_device) {
         std::lock_guard lock(global_lock);
         LayerData& ld = layer_data.at(get_key(*p_device));
+        ld.imgui_ctx                    = temp_ld.imgui_ctx;
+
         ld.device                       = temp_ld.device;
         ld.present_queue                = temp_ld.present_queue;
         ld.gfx_queue                    = temp_ld.gfx_queue;
@@ -1071,10 +1117,7 @@ SnapshotLayer_CmdDraw(
     std::lock_guard l(global_lock);
     LayerData& ld = layer_data.at(get_key(command_buffer));
 
-    if (!ld.curr_frame_event_params.contains(command_buffer)) {
-        ld.curr_frame_event_params.emplace(command_buffer, std::vector<EventParams> {});
-    }
-    ld.curr_frame_event_params.at(command_buffer).emplace_back(EventParams_Draw { vertex_count, instance_count, first_vertex, first_instance });
+    ld.curr_frame_event_params[command_buffer].emplace_back(EventParams_Draw { vertex_count, instance_count, first_vertex, first_instance });
 
     return ld.device_dispatch->CmdDraw(command_buffer, vertex_count, instance_count, first_vertex, first_instance);
 }
@@ -1098,10 +1141,7 @@ SnapshotLayer_CmdDrawIndexed(
     std::lock_guard l(global_lock);
     LayerData& ld = layer_data.at(get_key(command_buffer));
 
-    if (!ld.curr_frame_event_params.contains(command_buffer)) {
-        ld.curr_frame_event_params.emplace(command_buffer, std::vector<EventParams> {});
-    }
-    ld.curr_frame_event_params.at(command_buffer).emplace_back(EventParams_DrawIndexed {
+    ld.curr_frame_event_params[command_buffer].emplace_back(EventParams_DrawIndexed {
         index_count, instance_count, first_index, vertex_offset, first_instance });
 
     return ld.device_dispatch->CmdDrawIndexed(command_buffer, index_count, instance_count, first_index, vertex_offset, first_instance);
@@ -1118,12 +1158,52 @@ SnapshotLayer_CmdDispatch(
     std::lock_guard l(global_lock);
     LayerData& ld = layer_data.at(get_key(command_buffer));
 
-    if (!ld.curr_frame_event_params.contains(command_buffer)) {
-        ld.curr_frame_event_params.emplace(command_buffer, std::vector<EventParams> {});
-    }
-    ld.curr_frame_event_params.at(command_buffer).emplace_back(EventParams_Dispatch { group_count_x, group_count_y, group_count_z });
+    ld.curr_frame_event_params[command_buffer].emplace_back(EventParams_Dispatch { group_count_x, group_count_y, group_count_z });
 
     return ld.device_dispatch->CmdDispatch(command_buffer, group_count_x, group_count_y, group_count_z);
+}
+
+VK_LAYER_EXPORT void VKAPI_CALL
+SnapshotLayer_CmdDebugMarkerBeginEXT(VkCommandBuffer command_buffer, const VkDebugMarkerMarkerInfoEXT* p_marker_info) {
+    PRINT_DEBUG_FN_ENTER();
+    std::lock_guard l(global_lock);
+    LayerData& ld = layer_data.at(get_key(command_buffer));
+
+    if (p_marker_info) {
+        ld.curr_frame_event_params[command_buffer].emplace_back(EventParams_DebugMarkerBegin { p_marker_info->pMarkerName });
+    }
+
+    if (ld.device_dispatch->CmdDebugMarkerBeginEXT) {
+        return ld.device_dispatch->CmdDebugMarkerBeginEXT(command_buffer, p_marker_info);
+    }
+}
+
+VK_LAYER_EXPORT void VKAPI_CALL
+SnapshotLayer_CmdDebugMarkerEndEXT(VkCommandBuffer command_buffer) {
+    PRINT_DEBUG_FN_ENTER();
+    std::lock_guard l(global_lock);
+    LayerData& ld = layer_data.at(get_key(command_buffer));
+
+    ld.curr_frame_event_params[command_buffer].emplace_back(EventParams_DebugMarkerEnd {});
+
+    if (ld.device_dispatch->CmdDebugMarkerEndEXT) {
+        return ld.device_dispatch->CmdDebugMarkerEndEXT(command_buffer);
+    }
+}
+
+VK_LAYER_EXPORT void VKAPI_CALL
+SnapshotLayer_CmdDebugMarkerInsertEXT(VkCommandBuffer command_buffer, const VkDebugMarkerMarkerInfoEXT* p_marker_info) {
+    PRINT_DEBUG_FN_ENTER();
+    std::lock_guard l(global_lock);
+    LayerData& ld = layer_data.at(get_key(command_buffer));
+
+    if (p_marker_info) {
+        ld.curr_frame_event_params[command_buffer].emplace_back(EventParams_DebugMarkerInsert { p_marker_info->pMarkerName });
+    }
+
+    if (ld.device_dispatch->CmdDebugMarkerEndEXT) {
+        return ld.device_dispatch->CmdDebugMarkerEndEXT(command_buffer);
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
