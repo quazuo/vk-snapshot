@@ -92,7 +92,10 @@ if (const VkResult r = (result); r != VK_SUCCESS) { \
     ADD_HOOK(QueuePresentKHR)                       \
     ADD_HOOK(CmdDebugMarkerBeginEXT)                \
     ADD_HOOK(CmdDebugMarkerEndEXT)                  \
-    ADD_HOOK(CmdDebugMarkerInsertEXT)
+    ADD_HOOK(CmdDebugMarkerInsertEXT)               \
+    ADD_HOOK(CmdBeginDebugUtilsLabelEXT)            \
+    ADD_HOOK(CmdEndDebugUtilsLabelEXT)              \
+    ADD_HOOK(CmdInsertDebugUtilsLabelEXT)
 
 template<typename DispatchableType>
 void *get_key(DispatchableType inst) {
@@ -1163,6 +1166,8 @@ SnapshotLayer_CmdDispatch(
     return ld.device_dispatch->CmdDispatch(command_buffer, group_count_x, group_count_y, group_count_z);
 }
 
+// VK_EXT_debug_marker
+
 VK_LAYER_EXPORT void VKAPI_CALL
 SnapshotLayer_CmdDebugMarkerBeginEXT(VkCommandBuffer command_buffer, const VkDebugMarkerMarkerInfoEXT* p_marker_info) {
     PRINT_DEBUG_FN_ENTER();
@@ -1201,8 +1206,53 @@ SnapshotLayer_CmdDebugMarkerInsertEXT(VkCommandBuffer command_buffer, const VkDe
         ld.curr_frame_event_params[command_buffer].emplace_back(EventParams_DebugMarkerInsert { p_marker_info->pMarkerName });
     }
 
-    if (ld.device_dispatch->CmdDebugMarkerEndEXT) {
-        return ld.device_dispatch->CmdDebugMarkerEndEXT(command_buffer);
+    if (ld.device_dispatch->CmdDebugMarkerInsertEXT) {
+        return ld.device_dispatch->CmdDebugMarkerInsertEXT(command_buffer, p_marker_info);
+    }
+}
+
+// VK_EXT_debug_utils
+
+VK_LAYER_EXPORT void VKAPI_CALL
+SnapshotLayer_CmdBeginDebugUtilsLabelEXT(VkCommandBuffer command_buffer, const VkDebugUtilsLabelEXT* p_label_info) {
+    PRINT_DEBUG_FN_ENTER();
+    std::lock_guard l(global_lock);
+    LayerData& ld = layer_data.at(get_key(command_buffer));
+
+    if (p_label_info) {
+        ld.curr_frame_event_params[command_buffer].emplace_back(EventParams_DebugMarkerBegin { p_label_info->pLabelName });
+    }
+
+    if (ld.device_dispatch->CmdBeginDebugUtilsLabelEXT) {
+        return ld.device_dispatch->CmdBeginDebugUtilsLabelEXT(command_buffer, p_label_info);
+    }
+}
+
+VK_LAYER_EXPORT void VKAPI_CALL
+SnapshotLayer_CmdEndDebugUtilsLabelEXT(VkCommandBuffer command_buffer) {
+    PRINT_DEBUG_FN_ENTER();
+    std::lock_guard l(global_lock);
+    LayerData& ld = layer_data.at(get_key(command_buffer));
+
+    ld.curr_frame_event_params[command_buffer].emplace_back(EventParams_DebugMarkerEnd {});
+
+    if (ld.device_dispatch->CmdEndDebugUtilsLabelEXT) {
+        return ld.device_dispatch->CmdEndDebugUtilsLabelEXT(command_buffer);
+    }
+}
+
+VK_LAYER_EXPORT void VKAPI_CALL
+SnapshotLayer_CmdInsertDebugUtilsLabelEXT(VkCommandBuffer command_buffer, const VkDebugUtilsLabelEXT* p_label_info) {
+    PRINT_DEBUG_FN_ENTER();
+    std::lock_guard l(global_lock);
+    LayerData& ld = layer_data.at(get_key(command_buffer));
+
+    if (p_label_info) {
+        ld.curr_frame_event_params[command_buffer].emplace_back(EventParams_DebugMarkerInsert { p_label_info->pLabelName });
+    }
+
+    if (ld.device_dispatch->CmdInsertDebugUtilsLabelEXT) {
+        return ld.device_dispatch->CmdInsertDebugUtilsLabelEXT(command_buffer, p_label_info);
     }
 }
 
